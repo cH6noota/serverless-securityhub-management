@@ -1,0 +1,458 @@
+Description: Step Functions 
+Parameters:
+  Channel:
+    Description: Notify Channel ID
+    Type: String
+  ErrorChannel:
+    Description: Notify Error Channel ID
+    Type: String
+  AdminSlackId:
+    Description: Security Hub Admin Slack ID
+    Type: String
+
+
+Resources:
+
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:DeleteItem"
+                  - "events:PutEvents"
+                  - "securityhub:BatchUpdateFindings"
+                  - "xray:*"
+                Resource: "*"
+    
+  StateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString: 
+        !Sub
+          - |-
+            {
+              "Comment": "A description of my state machine",
+              "StartAt": "AWS Best Practices の検出の値存在チェック",
+              "States": {
+                "AWS Best Practices の検出の値存在チェック": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.detail.findings[0].ProductFields.StandardsArn",
+                      "IsPresent": true,
+                      "Next": "AWS Best Practices の検出のARNチェック"
+                    }
+                  ],
+                  "Default": "AWS best-practices 以外のため何もしない"
+                },
+                "AWS Best Practices の検出のARNチェック": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.detail.findings[0].ProductFields.StandardsArn",
+                      "StringMatches": "arn:aws:securityhub:::standards/aws-foundational-security-best-practices/v/1.0.0",
+                      "Next": "対応策の取得"
+                    }
+                  ],
+                  "Default": "AWS best-practices 以外のため何もしない"
+                },
+                "AWS best-practices 以外のため何もしない": {
+                  "Type": "Pass",
+                  "End": true
+                },
+                "対応策の取得": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:getItem",
+                  "Parameters": {
+                    "TableName": "ControleTable",
+                    "Key": {
+                      "type": {
+                        "S": "controle_id"
+                      },
+                      "typeId": {
+                        "S.$": "$.detail.findings[0].ProductFields.ControlId"
+                      }
+                    }
+                  },
+                  "Next": "対応策の存在確認",
+                  "ResultPath": "$.dynamo"
+                },
+                "対応策の存在確認": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.dynamo.Item",
+                      "IsPresent": true,
+                      "Next": "単発 or 是正 or 無効"
+                    }
+                  ],
+                  "Default": "対応策がDynamoDBへないことへの通知"
+                },
+                "対応策がDynamoDBへないことへの通知": {
+                  "Type": "Pass",
+                  "Next": "Slack通知",
+                  "Parameters": {
+                    "Channel": "${ErrorChannel}",
+                    "Mention": " ",
+                    "Subject.$": "States.Format('ControlId : {} の対応策をDynamo DBへ登録してください', $.detail.findings[0].ProductFields.ControlId)",
+                    "Message.$": "States.Format('検知内容: {}\n推奨事項URL:{}', $.detail.findings[0].Title, $.detail.findings[0].ProductFields.RecommendationUrl)",
+                    "Action": "<https://ap-northeast-1.console.aws.amazon.com/dynamodbv2/home?region=ap-northeast-1#item-explorer?initialTagKey=&maximize=true&table=all_securityhub|DynamoDB への登録はこちらから>"
+                  }
+                },
+                "単発 or 是正 or 無効": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.dynamo.Item.action_id.S",
+                      "StringEquals": "単発",
+                      "Next": "抑制済みに変更"
+                    },
+                    {
+                      "Variable": "$.dynamo.Item.action_id.S",
+                      "StringEquals": "是正",
+                      "Next": "通知済みに変更"
+                    }
+                  ],
+                  "Default": "無効化のため何もしない"
+                },
+                "無効化のため何もしない": {
+                  "Type": "Pass",
+                  "End": true
+                },
+                "通知済みに変更": {
+                  "Type": "Task",
+                  "Next": "Dymano登録用の日付を作成",
+                  "Parameters": {
+                    "FindingIdentifiers": [
+                      {
+                        "Id.$": "$.detail.findings[0].Id",
+                        "ProductArn.$": "$.detail.findings[0].ProductArn"
+                      }
+                    ],
+                    "Workflow": {
+                      "Status": "NOTIFIED"
+                    }
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:securityhub:batchUpdateFindings",
+                  "ResultPath": "$.sg_result"
+                },
+                "Dymano登録用の日付を作成": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "arn:aws:lambda:ap-northeast-1:${AWSAccountId}:function:time-creater:$LATEST"
+                  },
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException"
+                      ],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 6,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "是正の記録",
+                  "ResultPath": "$.lambda"
+                },
+                "是正の記録": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:putItem",
+                  "Parameters": {
+                    "TableName": "ControleTable",
+                    "Item": {
+                      "typeId": {
+                        "S.$": "$.sg_result.ProcessedFindings[0].Id"
+                      },
+                      "type": {
+                        "S.$": "$.lambda.Payload.exec_date"
+                      }
+                    }
+                  },
+                  "Next": "是正対応の説明テキスト作成",
+                  "ResultPath": null
+                },
+                "是正対応の説明テキスト作成": {
+                  "Type": "Pass",
+                  "Next": "Slackユーザの取得",
+                  "Result": {
+                    "title": "Security Hubで非常に危険な項目を検知しました:face_vomiting:\n可能な限り早急に対応してください。",
+                    "message": " "
+                  },
+                  "ResultPath": "$.action_detail"
+                },
+                "Slackユーザの取得": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:getItem",
+                  "Parameters": {
+                    "TableName": "ControleTable",
+                    "Key": {
+                      "type": {
+                        "S": "slack_id"
+                      },
+                      "typeId": {
+                        "S.$": "$.detail.findings[0].AwsAccountId"
+                      }
+                    }
+                  },
+                  "Next": "Slackユーザの確認",
+                  "ResultPath": "$.user_data"
+                },
+                "抑制済みに変更": {
+                  "Type": "Task",
+                  "Next": "単発対応の説明テキスト作成",
+                  "Parameters": {
+                    "FindingIdentifiers": [
+                      {
+                        "Id.$": "$.detail.findings[0].Id",
+                        "ProductArn.$": "$.detail.findings[0].ProductArn"
+                      }
+                    ],
+                    "Workflow": {
+                      "Status": "SUPPRESSED"
+                    }
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:securityhub:batchUpdateFindings",
+                  "ResultPath": null
+                },
+                "単発対応の説明テキスト作成": {
+                  "Type": "Pass",
+                  "Next": "Slackユーザの取得",
+                  "Result": {
+                    "title": "Security Hubで以下のリソースを検知しました。\n念の為、ご確認ください。",
+                    "message": " "
+                  },
+                  "ResultPath": "$.action_detail"
+                },
+                "Slackユーザの確認": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.user_data.Item",
+                      "IsPresent": true,
+                      "Next": "DynamoDBの結果よりメンションを作成"
+                    }
+                  ],
+                  "Default": "SecurityHub管理者へのメンションを作成"
+                },
+                "DynamoDBの結果よりメンションを作成": {
+                  "Type": "Pass",
+                  "Next": "追加のメッセージを空白で作成",
+                  "ResultPath": "$.slack_id",
+                  "Parameters": {
+                    "id.$": "States.Format('@{}', $.user_data.Item.slack_id.S)"
+                  }
+                },
+                "追加のメッセージを空白で作成": {
+                  "Type": "Pass",
+                  "Next": "SeverityLabel to ja text",
+                  "Result": {
+                    "text": ""
+                  },
+                  "ResultPath": "$.AddMessage"
+                },
+                "SecurityHub管理者へのメンションを作成": {
+                  "Type": "Pass",
+                  "Next": "追加のメッセージ作成",
+                  "Result": {
+                    "id": "@${AdminSlackID}"
+                  },
+                  "ResultPath": "$.slack_id"
+                },
+                "追加のメッセージ作成": {
+                  "Type": "Pass",
+                  "Next": "SeverityLabel to ja text",
+                  "ResultPath": "$.AddMessage",
+                  "Result": {
+                    "text": "\n以下のAWSアカウントは登録されていません"
+                  }
+                },
+                "SeverityLabel to ja text": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.detail.findings[0].Severity.Label",
+                          "StringEquals": "LOW"
+                        },
+                        {
+                          "Variable": "$.detail.findings[0].Severity.Label",
+                          "StringEquals": "INFORMATIONAL"
+                        }
+                      ],
+                      "Next": "低"
+                    },
+                    {
+                      "Variable": "$.detail.findings[0].Severity.Label",
+                      "StringEquals": "MEDIUM",
+                      "Next": "中"
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.detail.findings[0].Severity.Label",
+                          "StringEquals": "HIGH"
+                        },
+                        {
+                          "Variable": "$.detail.findings[0].Severity.Label",
+                          "StringEquals": "CRITICAL"
+                        }
+                      ],
+                      "Next": "高"
+                    }
+                  ],
+                  "Default": "不明"
+                },
+                "不明": {
+                  "Type": "Pass",
+                  "Next": "最終変換",
+                  "Result": {
+                    "text": "不明",
+                    "emoji": ":hatena:"
+                  },
+                  "ResultPath": "$.SeverityName"
+                },
+                "低": {
+                  "Type": "Pass",
+                  "Next": "最終変換",
+                  "Result": {
+                    "text": "低",
+                    "emoji": ":unamused:"
+                  },
+                  "ResultPath": "$.SeverityName"
+                },
+                "最終変換": {
+                  "Type": "Pass",
+                  "Next": "Slack通知",
+                  "Parameters": {
+                    "Channel": "${Channel}",
+                    "Mention.$": "States.Format('<{}> {}', $.slack_id.id, $.AddMessage.text)",
+                    "Subject.$": "States.Format('{} 緊急度: {} Security Hubセキュリティアラート Account: {}', $.SeverityName.emoji, $.SeverityName.text, $.detail.findings[0].AwsAccountId)",
+                    "Message.$": "States.Format('{}\n検知内容: {}\nリソース種類: {}\nリソースID: {}\n詳細: {}\nリージョン: {}\nコンソールURL: https://{}.console.aws.amazon.com/securityhub/home?region={}#/standards/aws-foundational-security-best-practices-1.0.0/{}\n推奨事項URL:{}', $.action_detail.title, $.detail.findings[0].Title, $.detail.findings[0].Resources[0].Type, $.detail.findings[0].Resources[0].Id, $.detail.findings[0].Description, $.detail.findings[0].Region, $.detail.findings[0].Region, $.detail.findings[0].Region, $.detail.findings[0].ProductFields.ControlId, $.detail.findings[0].ProductFields.RecommendationUrl)",
+                    "Action.$": "States.Format('{}', $.action_detail.message)"
+                  }
+                },
+                "Slack通知": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::events:putEvents",
+                  "Parameters": {
+                    "Entries": [
+                      {
+                        "Detail": {
+                          "Channel.$": "$.Channel",
+                          "Mention.$": "$.Mention",
+                          "Subject.$": "$.Subject",
+                          "Message.$": "$.Message",
+                          "Action.$": "$.Action"
+                        },
+                        "DetailType": "detail",
+                        "EventBusName": "security-hub-alert-aggregator-bus",
+                        "Source": "custom.securityalert.stepfunctions"
+                      }
+                    ]
+                  },
+                  "End": true
+                },
+                "中": {
+                  "Type": "Pass",
+                  "Next": "最終変換",
+                  "Result": {
+                    "text": "中",
+                    "emoji": ":face_with_monocle:"
+                  },
+                  "ResultPath": "$.SeverityName"
+                },
+                "高": {
+                  "Type": "Pass",
+                  "Next": "最終変換",
+                  "Result": {
+                    "text": "高",
+                    "emoji": ":face_with_symbols_on_mouth:"
+                  },
+                  "ResultPath": "$.SeverityName"
+                }
+              }
+            }
+          - {Channel: !Ref Channel, ErrorChannel: !Ref Channel, AWSAccountId: !Ref AWS::AccountId, AdminSlackID: !Ref AdminSlackId}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+      StateMachineName: securityhub-checker
+
+
+  DetectRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: "*"
+  
+  DetectRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-hub-detect-rule
+      EventBusName: default
+      Description: "Security New Detect"
+      State: ENABLED
+      EventPattern: { "source": ["aws.securityhub"], "detail-type": ["Security Hub Findings - Imported"], "detail": { "findings": { "Compliance": { "Status": ["FAILED"] }, "Workflow": { "Status": ["NEW"] } } } }
+      Targets:
+      - Arn: !GetAtt [ StateMachine, Arn ]
+        Id: TargetStateMachine
+        RoleArn: !GetAtt [ DetectRuleRole, Arn ]
+  
+  StepFunctionsErrorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-hub-stepfunctions-error
+      EventBusName: default
+      Description: "Step Functions Error"
+      EventPattern: { "source": ["aws.states"], "detail-type": ["Step Functions Execution Status Change"], "detail": { "status": ["FAILED", "TIMED_OUT", "ABORTED"] } }
+      Targets:
+        - Arn: !ImportValue EventApiDestinationARN
+          Id: ErrorSlackApi
+          RoleArn: !ImportValue AlertEventRuleRoleARN
+          InputTransformer:
+            InputPathsMap:
+              id: "$.detail.name"
+            InputTemplate: !Sub '{"channel":"${ErrorChannel}","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"<@${AdminSlackId}>"}},{"type":"section","text":{"type":"mrkdwn","text":":smiling_imp:*StepFunctionsでエラーが発生しました*"}},{"type":"section","text":{"type":"mrkdwn","text":"<https://ap-northeast-1.console.aws.amazon.com/states/home?region=ap-northeast-1#/executions/details/arn:aws:states:ap-northeast-1:${AWS::AccountId}:execution:securityhub-checker:<id>|AWSコンソール>から確認を行ってください"}}]}'
+            # InputTemplate: |
+            #   { 
+            #     "channel": "${ErrorChannel}", 
+            #     "blocks": [ { "type": "section", "text": { "type": "mrkdwn", "text": "<AdminMention>" } }, { "type": "section", "text": { "type": "mrkdwn", "text": ":smiling_imp: *Step Functions でエラーが発生しました*" } }, { "type": "section", "text": { "type": "mrkdwn", "text": "<https://ap-northeast-1.console.aws.amazon.com/states/home?region=ap-northeast-1#/executions/details/arn:aws:states:ap-northeast-1:${AWS::AccountId}:execution:securityhub-checker:<id>|AWSコンソール>から確認を行ってください" } } ] 
+            #   }
+
+
+

@@ -1,0 +1,361 @@
+Description: Step Functions Assets
+Parameters:
+  BotUserOAuthToken:
+    Description: Enter token for bot authentication.
+    Type: String
+
+Resources:
+
+  AlertEventRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: security-hub-alert-slack-eventrule-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+  AlertEventRulePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: security-hub-alert-slack-eventrule-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "events:InvokeApiDestination"
+            Resource: !GetAtt EventApiDestination.Arn
+      Roles:
+        - !Ref AlertEventRuleRole
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties: 
+      Name: security-hub-alert-aggregator-bus
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: security-hub-alert-slack-rule
+      EventBusName: security-hub-alert-aggregator-bus
+      Description: "Security alert"
+      EventPattern: { "source": ["custom.securityalert.stepfunctions"] }
+      Targets:
+        - Arn: !GetAtt EventApiDestination.Arn
+          Id: IdSendAlertSlackApi
+          RoleArn: !GetAtt AlertEventRuleRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              Action: "$.detail.Action"
+              Channel: "$.detail.Channel"
+              Mention: "$.detail.Mention"
+              Message: "$.detail.Message"
+              Subject: "$.detail.Subject"
+            InputTemplate: '{"channel":"<Channel>","text":"<Subject>","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"<Mention>"}},{"type":"header","text":{"type":"plain_text","text":"<Subject>"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"<Message>"}},{"type":"divider"},{"type":"section","text":{"type":"mrkdwn","text":"<Action>"}}]}'
+  EventApiDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      Description: "Security alert ApiDestination"
+      ConnectionArn: !GetAtt EventConnection.Arn
+      HttpMethod: POST
+      InvocationEndpoint: "https://slack.com/api/chat.postMessage"
+      InvocationRateLimitPerSecond: 300
+      Name: security-hub-alert-slack-apidestination
+  EventConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      AuthorizationType: API_KEY
+      Description: "Security alert Connection"
+      Name: security-hub-alert-slack-connection
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: Authorization
+          ApiKeyValue: !Sub Bearer ${BotUserOAuthToken}
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: detect-one-month
+      Description: detect-one-month
+      ScheduleExpression: 'cron(0 1 * * ? *)'
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt 'PullerLambda.Arn'
+        Id: TargetFunctionV1
+
+  NotifySQS:
+    Type: AWS::SQS::Queue
+    Properties: 
+       QueueName: securityhub-notify-queue
+  SQSPolicy: 
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      Queues: 
+        - !Ref NotifySQS
+      PolicyDocument: 
+        Statement: 
+          - 
+            Action: 
+              - "SQS:*"
+            Effect: "Allow"
+            Resource: 
+              Fn::GetAtt:
+                - "NotifySQS"
+                - "Arn"
+            Principal:  
+              AWS: 
+                - "*"  
+
+  TimeCreateLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole'
+      Path: "/"
+  TimeCreateLambda:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: time-creater
+        Runtime: python3.9
+        Handler: index.lambda_handler
+        Role: !GetAtt TimeCreateLambdaRole.Arn
+        Code:
+          ZipFile: |
+            import datetime
+
+            def lambda_handler(event, context):
+              return { 'statusCode': 200, 'exec_date': datetime.datetime.now().strftime('%Y%m%d') }
+
+
+  PullerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: PullerLambda-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:SendMessage"
+                Resource: "*"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess'
+      Path: "/"
+  PullerLambda:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: records-puller
+        Runtime: python3.9
+        Handler: index.lambda_handler
+        Role: !GetAtt PullerLambdaRole.Arn
+        Timeout: 30
+        Environment:
+          Variables:
+            SQS_URL: !GetAtt NotifySQS.Arn
+        Code:
+          ZipFile: |
+            import json
+            import datetime
+            import boto3
+            from boto3.dynamodb.conditions import Key, Attr
+            import random, string
+
+
+            sqs_url = os.environ.get('SQS_URL') 
+            
+            def lambda_handler(event, context):
+              dynamo_to_sqs()
+               return {
+                'statusCode': 200,
+                'body': json.dumps('records-puller execute')
+              }
+            
+            def randomname(n):
+              randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
+              return ''.join(randlst)
+
+            def dynamo_to_sqs():
+              dynamodb = boto3.resource('dynamodb', region_name="ap-northeast-1")
+              table = dynamodb.Table('all_securityhub')
+              now = datetime.datetime.now()
+              td = datetime.timedelta(days=31)
+              target = (now - td).strftime('%Y%m%d')
+
+              response = table.query(
+                  KeyConditionExpression=Key('type').eq(target)
+              )
+              items = response.get("Items", [])
+
+              response = table.query(
+                  KeyConditionExpression=Key('type').eq(target)
+              )
+              items = response.get("Items", [])
+              sqs = boto3.client('sqs', region_name="ap-northeast-1")
+              
+              
+              msg_list = [{"Id":randomname(12), 'MessageBody' : json.dumps(item) } for item in items ]
+              msg_lists = [msg_list[i:i+10] for i in range(0,len(msg_list),10)]
+              
+              for msg_list in msg_lists:
+                  response = sqs.send_message_batch(
+                      QueueUrl=sqs_url,
+                      Entries=msg_list
+                  )
+  PullerLambdaEventSource:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PullerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  CheckerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: CheckerLambda-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                  - states:StartExecution
+                Resource: "*"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AWSSecurityHubReadOnlyAccess'
+      Path: "/"
+  CheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: records-checker
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckerLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          AccountID: !Ref "AWS::AccountId"
+      Code:
+        ZipFile: |
+          import json
+          import datetime
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+          import random, string
+          import os
+
+          arn = "arn:aws:states:ap-northeast-1:" + os.environ.get('AccountID') + ":stateMachine:securityhub-checker"
+
+          def lambda_handler(event, context):
+            for record in event.get('Records',[]):
+                check_security(record)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('From SQS execute')
+            }
+          
+          def check_security(record):
+            body = json.loads(record["body"])
+            client = boto3.client('securityhub', "ap-northeast-1")
+            filter_param = {
+                'Id': [
+                    {
+                        'Value': body["type_id"], 
+                        'Comparison': 'EQUALS'
+                    },
+                ]
+            
+            }
+            res = client.get_findings(
+                Filters=filter_param,
+                MaxResults = 1
+            )
+            if res["Findings"][0]["RecordState"] == "ACTIVE":
+                # Notify
+                send_step_function(res["Findings"][0])
+            
+            # Dynamo Delete
+            dynamodb = boto3.resource('dynamodb', "ap-northeast-1")
+            table = dynamodb.Table('all_securityhub')
+            response = table.delete_item(
+                Key={
+                    'type': body["type"],
+                    'type_id': body["type_id"]
+                }
+            )
+
+            def randomname(n):
+              randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
+              return ''.join(randlst)
+
+            def send_step_function(data):
+              client = boto3.client('stepfunctions', "ap-northeast-1")
+              finding = {
+                "detail": {
+                  "findings": [
+                      data
+                  ]
+                }
+              }
+              response = client.start_execution(
+                  stateMachineArn=arn,
+                  name =randomname(24),
+                  input=json.dumps(finding),
+              )
+  CheckerLambdaEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: 
+      Enabled: true
+      EventSourceArn: !GetAtt NotifySQS.Arn
+      FunctionName: !GetAtt CheckerLambda.Arn
+      BatchSize: 1
+
+
+Outputs:
+  EventApiDestinationARN:
+    Value: !GetAtt EventApiDestination.Arn
+    Export:
+      Name: EventApiDestinationARN
+  AlertEventRuleRoleARN:
+    Value: !GetAtt AlertEventRuleRole.Arn
+    Export:
+      Name: AlertEventRuleRoleARN
+      
+
+  
