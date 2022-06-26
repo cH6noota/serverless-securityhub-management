@@ -176,10 +176,11 @@ Resources:
         Timeout: 30
         Environment:
           Variables:
-            SQS_URL: !GetAtt NotifySQS.Arn
+            SQS_URL: !Ref NotifySQS
         Code:
           ZipFile: |
             import json
+            import os
             import datetime
             import boto3
             from boto3.dynamodb.conditions import Key, Attr
@@ -190,7 +191,7 @@ Resources:
             
             def lambda_handler(event, context):
               dynamo_to_sqs()
-               return {
+              return {
                 'statusCode': 200,
                 'body': json.dumps('records-puller execute')
               }
@@ -201,7 +202,7 @@ Resources:
 
             def dynamo_to_sqs():
               dynamodb = boto3.resource('dynamodb', region_name="ap-northeast-1")
-              table = dynamodb.Table('all_securityhub')
+              table = dynamodb.Table('ControleTable')
               now = datetime.datetime.now()
               td = datetime.timedelta(days=31)
               target = (now - td).strftime('%Y%m%d')
@@ -296,7 +297,7 @@ Resources:
             filter_param = {
                 'Id': [
                     {
-                        'Value': body["type_id"], 
+                        'Value': body["typeId"], 
                         'Comparison': 'EQUALS'
                     },
                 ]
@@ -312,32 +313,32 @@ Resources:
             
             # Dynamo Delete
             dynamodb = boto3.resource('dynamodb', "ap-northeast-1")
-            table = dynamodb.Table('all_securityhub')
+            table = dynamodb.Table('ControleTable')
             response = table.delete_item(
                 Key={
                     'type': body["type"],
-                    'type_id': body["type_id"]
+                    'typeId': body["typeId"]
                 }
             )
 
-            def randomname(n):
-              randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
-              return ''.join(randlst)
+          def randomname(n):
+            randlst = [random.choice(string.ascii_letters + string.digits) for i in range(n)]
+            return ''.join(randlst)
 
-            def send_step_function(data):
-              client = boto3.client('stepfunctions', "ap-northeast-1")
-              finding = {
-                "detail": {
-                  "findings": [
-                      data
-                  ]
-                }
+          def send_step_function(data):
+            client = boto3.client('stepfunctions', "ap-northeast-1")
+            finding = {
+              "detail": {
+                "findings": [
+                    data
+                ]
               }
-              response = client.start_execution(
-                  stateMachineArn=arn,
-                  name =randomname(24),
-                  input=json.dumps(finding),
-              )
+            }
+            response = client.start_execution(
+                stateMachineArn=arn,
+                name =randomname(24),
+                input=json.dumps(finding),
+            )
   CheckerLambdaEventSource:
     Type: AWS::Lambda::EventSourceMapping
     Properties: 
